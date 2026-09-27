@@ -1,0 +1,30 @@
+legal_suffixes:
+  - "private limited"
+  - "pvt ltd"
+  - "pvt"
+  - "limited"
+  - "ltd"
+  - "llp"
+
+address_abbreviations:
+  opp: "opposite"
+  nr: "near"
+  rd: "road"
+  st: "street"
+  flr: "floor"
+  fl: "floor"
+  dist: "district"
+  sec: "sector"
+  apt: "apartment"
+  soc: "society"
+  bldg: "building"
+  no: "number"
+
+landmarks:
+  - "near"
+  - "opp"
+  - "opposite"
+  - "behind"
+  - "beside"
+  - "next to"
+  - "adjacent to"

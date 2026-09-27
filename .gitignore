@@ -1,0 +1,28 @@
+# Datasets & Large Raw Files (>100MB rejected by GitHub)
+DATASET/
+dataset/
+submission_pkg/
+output/*.tsv
+*.zip
+*.tar.gz
+*.7z
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary directories & pickle files
+temp_*/
+*.pkl
+*.pickle
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

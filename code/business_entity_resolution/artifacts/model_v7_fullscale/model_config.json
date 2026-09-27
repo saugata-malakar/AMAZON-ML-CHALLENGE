@@ -1,0 +1,162 @@
+{
+  "metadata": {
+    "model_name": "EntityResolvers-v7-FullScale",
+    "description": "Gradient Boosted Decision Tree for Business Entity Resolution",
+    "model_architecture": "HistGradientBoostingClassifier",
+    "framework": "scikit-learn",
+    "license": "BSD-3-Clause",
+    "export_timestamp": "2026-09-27 12:38:35",
+    "reproducibility": "100% deterministic (no retraining required on new machines)"
+  },
+  "hyperparameters": {
+    "max_iter": 300,
+    "max_depth": 7,
+    "learning_rate": 0.05,
+    "min_samples_leaf": 20,
+    "l2_regularization": 0.3,
+    "random_state": 42
+  },
+  "decision_threshold": {
+    "optimal_tau": 0.54,
+    "metric_target": "macro_F0.5",
+    "assignment_rule": "greedy_1_to_1_priority_locking",
+    "tie_breaking_order": "[-probability, s1_id, target_id]"
+  },
+  "features": {
+    "num_features": 14,
+    "feature_list": [
+      {
+        "index": 0,
+        "name": "name_token_jaccard"
+      },
+      {
+        "index": 1,
+        "name": "name_2gram_jaccard"
+      },
+      {
+        "index": 2,
+        "name": "name_3gram_jaccard"
+      },
+      {
+        "index": 3,
+        "name": "name_prefix_ratio"
+      },
+      {
+        "index": 4,
+        "name": "name_length_ratio"
+      },
+      {
+        "index": 5,
+        "name": "name_token_containment"
+      },
+      {
+        "index": 6,
+        "name": "addr_token_jaccard"
+      },
+      {
+        "index": 7,
+        "name": "addr_2gram_jaccard"
+      },
+      {
+        "index": 8,
+        "name": "addr_3gram_jaccard"
+      },
+      {
+        "index": 9,
+        "name": "numeric_overlap_jaccard"
+      },
+      {
+        "index": 10,
+        "name": "missing_addr_flag"
+      },
+      {
+        "index": 11,
+        "name": "combined_token_jaccard"
+      },
+      {
+        "index": 12,
+        "name": "combined_3gram_jaccard"
+      },
+      {
+        "index": 13,
+        "name": "blocker_idf_weight"
+      }
+    ]
+  },
+  "blocking_configuration": {
+    "strategy": "distinctive_token_inverted_index_with_idf",
+    "top_k_candidates": 15,
+    "max_posting_cutoff": 300,
+    "adaptive_pruning_alpha": 0.3,
+    "country_partitioning": true
+  },
+  "preprocessing_rules": {
+    "stopwords_count": 63,
+    "stopwords": [
+      "and",
+      "at",
+      "av",
+      "ave",
+      "avenue",
+      "bd",
+      "block",
+      "boulevard",
+      "co",
+      "colony",
+      "company",
+      "corp",
+      "corporation",
+      "cross",
+      "de",
+      "des",
+      "door",
+      "dr",
+      "drive",
+      "du",
+      "east",
+      "en",
+      "floor",
+      "france",
+      "house",
+      "impasse",
+      "in",
+      "inc",
+      "la",
+      "lane",
+      "le",
+      "les",
+      "limited",
+      "llc",
+      "ln",
+      "ltd",
+      "main",
+      "nagar",
+      "near",
+      "new",
+      "no",
+      "north",
+      "null",
+      "of",
+      "old",
+      "opp",
+      "opposite",
+      "phase",
+      "plot",
+      "private",
+      "pvt",
+      "rd",
+      "road",
+      "rue",
+      "sarl",
+      "sas",
+      "sci",
+      "sector",
+      "south",
+      "st",
+      "street",
+      "the",
+      "west"
+    ],
+    "accent_normalization": "NFKD Unicode decomposition with diacritics preservation"
+  }
+}
