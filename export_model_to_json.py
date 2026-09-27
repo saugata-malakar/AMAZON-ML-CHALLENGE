@@ -180,24 +180,9 @@ def export_model(model_pkl_path, out_dir, model_name):
     assert max_err < 1e-6, f"Parity check failed for {model_name}: {max_err}"
     print(f"  SUCCESS: 100% exact numerical match confirmed for {model_name}!", flush=True)
 
-# Export v7 (Full Scale)
+# Export Production Model
 v7_path = os.path.join(BASE, "DATASET", "student_resource", "temp_v7", "clf_v7.pkl")
-export_model(
-    v7_path,
-    os.path.join(BASE, "code", "business_entity_resolution", "artifacts", "model_v7_fullscale"),
-    "EntityResolvers-v7-FullScale"
-)
-
-# Export v6 (Dual Blocker)
-v6_path = os.path.join(BASE, "temp_v6", "clf_v6.pkl")
-export_model(
-    v6_path,
-    os.path.join(BASE, "code", "business_entity_resolution", "artifacts", "model_v6_dualblocker"),
-    "EntityResolvers-v6-DualBlocker"
-)
-
-# Also copy primary model to main artifacts directory
 primary_out = os.path.join(BASE, "code", "business_entity_resolution", "artifacts")
 export_model(v7_path, primary_out, "EntityResolvers-Production")
 
-print("\nAll model parameters successfully exported to JSON files!")
+print("\nModel parameters successfully exported to JSON files!")

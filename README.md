@@ -22,9 +22,7 @@ This repository contains the complete, production-grade, reproducible Machine Le
 │   └── business_entity_resolution/
 │       ├── artifacts/                # Exported JSON models (config, parameters, trees)
 │       │   ├── model_config.json     # Hyperparameters, threshold tau, feature definitions
-│       │   ├── model_parameters.json # Complete tree weights and split nodes (zero retraining)
-│       │   ├── model_v6_dualblocker/ # v6 model JSON export
-│       │   └── model_v7_fullscale/   # v7 full-scale model JSON export
+│       │   └── model_parameters.json # Complete tree weights and split nodes (zero retraining)
 │       ├── configs/                  # Hand-authored abbreviation dictionaries (fr, in, us, global)
 │       ├── src/                      # Production pipeline source modules
 │       │   ├── normalize/            # Unicode, diacritics, legal suffixes, addresses
@@ -33,18 +31,15 @@ This repository contains the complete, production-grade, reproducible Machine Le
 │       │   ├── models/               # GBDT pairwise matching models
 │       │   ├── decision/             # Greedy 1-to-1 priority locking & thresholding
 │       │   ├── predict_from_json.py  # Zero-retraining portable inference engine
-│       │   └── run_full_production.py# End-to-end production script
+│       │   └── run_full_production.py# End-to-end full-scale production script
 │       ├── tests/                    # Passing pytest suite
 │       ├── utils/                    # Organizer submission validator
 │       ├── README.md                 # Detailed code README
 │       └── requirements.txt          # Minimal Python dependencies
 │
 ├── Documentation_template.md         # Comprehensive methodology and audit report
-├── run_full_production.py            # Root runner for production pipeline
-├── run_v7_fullscale.py               # Full-scale pipeline runner
-├── export_model_to_json.py           # Model parameter exporter and numerical verifier
-├── audit_*.py                        # Empirical audit scripts (LOCO, R6/R7/R8, cross-country)
-└── test_*.py                         # Validation and threshold tuning benchmarks
+├── run_full_production.py            # Canonical full-scale production runner
+└── export_model_to_json.py           # Model parameter exporter and numerical verifier
 ```
 
 ---

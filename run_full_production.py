@@ -1,402 +1,519 @@
 #!/usr/bin/env python3
 """
-Amazon ML Challenge 2026 — Complete Production Pipeline
-End-to-End: Fast Blocking -> Feature Extraction -> HistGradientBoosting -> Macro F0.5 Thresholding -> Greedy 1-to-1 Matching -> Submission Generation & Validation
+v7 FULL-SCALE Pipeline: Train on realistic target pool sizes, re-tune threshold.
+Key changes from v5:
+1. Train on 100k S1 entities (not 45k)
+2. Load ALL training targets (~10.3M) for index building (not 1M)
+3. Build index PER COUNTRY to match test-time regime
+4. Re-tune threshold on held-out val at realistic scale
+5. Adaptive candidate depth (alpha=0.3) to reduce candidate count
 """
-import time, os, sys, re, gc
+import time, os, sys, re, gc, math, pickle
 from collections import defaultdict, Counter
 import numpy as np
-import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 sys.stdout.reconfigure(encoding='utf-8')
 
 BASE = r"c:\Users\Administrator\Downloads\AMAZON\DATASET\student_resource"
 TRAIN_DIR = os.path.join(BASE, "dataset", "train")
-TEST_DIR = os.path.join(BASE, "dataset", "test")
+TEST_DIR  = os.path.join(BASE, "dataset", "test")
 OUTPUT_DIR = os.path.join(BASE, "output")
+TEMP_DIR  = os.path.join(BASE, "temp_v7")
+os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+TOP_K = 15
+MAX_POSTING = 300
+ALPHA_ADAPTIVE = 0.3  # Adaptive candidate pruning
+
 STOPWORDS = {
-    'inc', 'corp', 'corporation', 'llc', 'ltd', 'limited', 'pvt', 'private',
-    'co', 'company', 'and', 'the', 'of', 'in', 'at', 'road', 'rd', 'street',
-    'st', 'avenue', 'ave', 'lane', 'ln', 'drive', 'dr', 'nagar', 'colony',
-    'floor', 'near', 'opp', 'opposite', 'block', 'sector', 'phase', 'house',
-    'plot', 'door', 'no', 'null', 'sarl', 'sas', 'sci', 'france', 'de', 'la',
-    'le', 'du', 'des', 'les', 'en', 'rue', 'bd', 'boulevard', 'av', 'impasse'
+    'inc','corp','corporation','llc','ltd','limited','pvt','private','co','company',
+    'and','the','of','in','at','road','rd','street','st','avenue','ave','lane','ln',
+    'drive','dr','nagar','colony','floor','near','opp','opposite','block','sector',
+    'phase','house','plot','door','no','null','sarl','sas','sci','france','de','la',
+    'le','du','des','les','en','rue','bd','boulevard','av','impasse','new','old',
+    'east','west','north','south','main','cross'
 }
 
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def log(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def clean_toks(n, a):
+    text = (n + " " + a).lower()
+    return [w for w in re.sub(r'[^\w\s]', ' ', text).split() if len(w) >= 3 and w not in STOPWORDS]
+def get_words(t): return set(re.findall(r'\w+', t.lower()))
+def get_2grams(t):
+    t2 = t.lower()
+    return set(t2[i:i+2] for i in range(len(t2)-1)) if len(t2)>=2 else set()
+def get_3grams(t):
+    t3 = t.lower()
+    return set(t3[i:i+3] for i in range(len(t3)-2)) if len(t3)>=3 else set()
+def jac(a,b): return len(a&b)/len(a|b) if (a and b) else 0.0
 
-def clean_toks(name, addr):
-    text = (name + " " + addr).lower()
-    text = re.sub(r'[^\w\s]', ' ', text)
-    return set(w for w in text.split() if len(w) >= 3 and w not in STOPWORDS)
+def precompute_s1(n, a):
+    nc = re.sub(r'[^\w\s]',' ', n.lower()).strip()
+    ac = re.sub(r'[^\w\s]',' ', a.lower()).strip()
+    return (get_words(n), get_2grams(n), get_3grams(n),
+            get_words(a), get_2grams(a), get_3grams(a),
+            set(re.findall(r'\d+', a)), nc, ac)
 
-def get_words(text):
-    return set(re.findall(r'\w+', text.lower()))
-
-def get_3grams(text):
-    t = text.lower()
-    return set(t[i:i+3] for i in range(len(t)-2))
-
-def fast_jaccard(s1, s2):
-    if not s1 or not s2: return 0.0
-    return len(s1 & s2) / len(s1 | s2)
-
-def extract_features(s1_n, s1_a, t_n, t_a, shared_tok_count):
-    n_tok1 = get_words(s1_n)
-    n_tok2 = get_words(t_n)
-    n_jacc = fast_jaccard(n_tok1, n_tok2)
-    
-    n_3g1 = get_3grams(s1_n)
-    n_3g2 = get_3grams(t_n)
-    n_3g_jacc = fast_jaccard(n_3g1, n_3g2)
-    
-    a_tok1 = get_words(s1_a)
-    a_tok2 = get_words(t_a)
-    a_jacc = fast_jaccard(a_tok1, a_tok2)
-    
-    num1 = set(re.findall(r'\d+', s1_a))
-    num2 = set(re.findall(r'\d+', t_a))
-    num_jacc = fast_jaccard(num1, num2)
-    
-    len1 = len(s1_n)
-    len2 = len(t_n)
-    len_ratio = (min(len1, len2) + 1) / (max(len1, len2) + 1)
-    
-    c_jacc = fast_jaccard(n_tok1 | a_tok1, n_tok2 | a_tok2)
-    
-    return [n_jacc, n_3g_jacc, a_jacc, num_jacc, len_ratio, shared_tok_count, c_jacc]
+def extract_features(s1p, tn, ta, idf_w):
+    (nt1,n2g1,n3g1,at1,a2g1,a3g1,num1,s1nc,s1ac) = s1p
+    tnc = re.sub(r'[^\w\s]',' ', tn.lower()).strip()
+    tac = re.sub(r'[^\w\s]',' ', ta.lower()).strip()
+    nt2=get_words(tn); n2g2=get_2grams(tn); n3g2=get_3grams(tn)
+    at2=get_words(ta); a2g2=get_2grams(ta); a3g2=get_3grams(ta)
+    num2=set(re.findall(r'\d+', ta))
+    ml=min(len(s1nc),len(tnc))
+    pfx=0
+    if ml>0:
+        for i in range(ml):
+            if s1nc[i]==tnc[i]: pfx+=1
+            else: break
+        pfx /= ml
+    return [jac(nt1,nt2), jac(n2g1,n2g2), jac(n3g1,n3g2), pfx,
+            (min(len(s1nc),len(tnc))+1)/(max(len(s1nc),len(tnc))+1),
+            len(nt1&nt2)/max(len(nt1),1),
+            jac(at1,at2), jac(a2g1,a2g2), jac(a3g1,a3g2),
+            jac(num1,num2), 1.0 if (not s1ac or not tac) else 0.0,
+            jac(nt1|at1,nt2|at2), jac(n3g1|a3g1,n3g2|a3g2), idf_w]
 
 def macro_f05(gt_dict, pred_dict):
     scores = []
-    for s1_id, true_targets in gt_dict.items():
-        preds = set(pred_dict.get(s1_id, []))
-        if not true_targets:
-            scores.append(1.0 if not preds else 0.0)
+    for sid, tt in gt_dict.items():
+        pp = set(pred_dict.get(sid, []))
+        if not tt: scores.append(1.0 if not pp else 0.0)
         else:
-            if not preds:
-                scores.append(0.0)
+            if not pp: scores.append(0.0)
             else:
-                tp = len(preds & true_targets)
-                precision = tp / len(preds)
-                recall = tp / len(true_targets)
-                denom = 0.25 * precision + recall
-                f05 = (1.25 * precision * recall) / denom if denom > 0 else 0.0
-                scores.append(f05)
-    return float(np.mean(scores)) if scores else 0.0
+                tp=len(pp&tt); p=tp/len(pp); r=tp/len(tt)
+                d = 0.25*p + r
+                scores.append((1.25*p*r)/d if d>0 else 0.0)
+    return float(np.mean(scores))
 
-def train_and_optimize():
-    log("="*60)
-    log("PHASE 1: TRAINING & THRESHOLD OPTIMIZATION")
-    log("="*60)
-    
-    # 1. Load GT sample
-    log("Loading Ground Truth sample for training...")
-    gt_map = {}
-    with open(os.path.join(TRAIN_DIR, "train_ground_truth.tsv"), encoding='utf-8') as f:
+# =====================================================
+# PHASE 1: LOAD ALL TRAINING DATA AT FULL SCALE
+# =====================================================
+log("=" * 60)
+log("v7 FULL-SCALE PIPELINE")
+log("=" * 60)
+
+# Load GT — use 200k entities (100k train + 100k val)
+TOTAL_N = 200000
+TRAIN_N = 100000
+
+log(f"Loading first {TOTAL_N:,} GT entries...")
+t0 = time.time()
+gt_map = {}
+with open(os.path.join(TRAIN_DIR, "train_ground_truth.tsv"), encoding='utf-8') as f:
+    f.readline()
+    for line in f:
+        p = line.rstrip('\n').split('\t')
+        m = [x.strip() for x in p[1].split(',') if x.strip()] if len(p)>1 else []
+        gt_map[p[0]] = set(m)
+        if len(gt_map) >= TOTAL_N: break
+
+s1_needed = set(gt_map.keys())
+log(f"  GT loaded: {len(gt_map):,} entities in {time.time()-t0:.1f}s")
+
+# Load S1 records
+log("Loading S1 records...")
+t0 = time.time()
+s1_recs = {}
+with open(os.path.join(TRAIN_DIR, "train_source1.tsv"), encoding='utf-8') as f:
+    f.readline()
+    for line in f:
+        p = line.rstrip('\n').split('\t')
+        if p[0] in s1_needed:
+            s1_recs[p[0]] = (p[1], p[2], p[3])
+            if len(s1_recs) == len(s1_needed): break
+log(f"  S1 loaded: {len(s1_recs):,} in {time.time()-t0:.1f}s")
+
+s1_list = list(s1_recs.keys())
+train_ids = s1_list[:TRAIN_N]
+val_ids   = s1_list[TRAIN_N:TOTAL_N]
+
+# Determine all needed target IDs from GT
+all_needed_tgts = set()
+for sid in s1_needed:
+    all_needed_tgts |= gt_map[sid]
+
+# =====================================================
+# PHASE 2: LOAD FULL TARGET POOL (ALL RECORDS)
+# =====================================================
+log("Loading FULL S2+S3 target pool (ALL records, not subsampled)...")
+t0 = time.time()
+tgt_recs = {}
+for sf in ["train_source2.tsv", "train_source3.tsv"]:
+    with open(os.path.join(TRAIN_DIR, sf), encoding='utf-8') as f:
         f.readline()
         for line in f:
             p = line.rstrip('\n').split('\t')
-            m = [x.strip() for x in p[1].split(',') if x.strip()] if len(p) > 1 else []
-            gt_map[p[0]] = set(m)
-            if len(gt_map) >= 40000:
-                break
-                
-    s1_eval_ids = set(gt_map.keys())
-    
-    # 2. Load S1 records
-    s1_records = {}
-    with open(os.path.join(TRAIN_DIR, "train_source1.tsv"), encoding='utf-8') as f:
-        f.readline()
-        for line in f:
-            p = line.rstrip('\n').split('\t')
-            if p[0] in s1_eval_ids:
-                s1_records[p[0]] = (p[1], p[2], p[3])
-                if len(s1_records) == len(s1_eval_ids):
-                    break
-    log(f"Loaded {len(s1_records):,} S1 training entities")
-    
-    s1_list = list(s1_records.keys())
-    train_s1_ids = set(s1_list[:25000])
-    val_s1_ids = set(s1_list[25000:])
-    
-    all_needed_targets = set()
-    for sid in s1_eval_ids:
-        all_needed_targets |= gt_map[sid]
-        
-    # 3. Load Targets sample (all needed true targets + 800k distractors)
-    log("Loading S2 and S3 target records...")
-    tgt_records = {}
-    for sf in ["train_source2.tsv", "train_source3.tsv"]:
-        with open(os.path.join(TRAIN_DIR, sf), encoding='utf-8') as f:
-            f.readline()
-            for i, line in enumerate(f):
-                p = line.rstrip('\n').split('\t')
-                if p[0] in all_needed_targets or i < 400000:
-                    tgt_records[p[0]] = (p[1], p[2], p[3])
-    log(f"Loaded {len(tgt_records):,} target records for training")
-    
-    # 4. Build inverted index
-    log("Building inverted index on targets...")
+            if len(p) >= 4:
+                tgt_recs[p[0]] = (p[1], p[2], p[3])
+log(f"  FULL target pool: {len(tgt_recs):,} records in {time.time()-t0:.1f}s")
+
+# =====================================================
+# PHASE 3: TRAIN PER COUNTRY (matching test-time regime)
+# =====================================================
+# Group S1 and targets by country
+countries = ['US', 'India']
+s1_by_country = defaultdict(list)
+for sid in train_ids:
+    s1_by_country[s1_recs[sid][2]].append(sid)
+
+val_by_country = defaultdict(list)
+for sid in val_ids:
+    val_by_country[s1_recs[sid][2]].append(sid)
+
+X_all, y_all = [], []
+
+for country in countries:
+    log(f"\n--- Building training pairs for {country} ---")
     t0 = time.time()
-    inv_index = defaultdict(list)
-    tgt_id_list = list(tgt_records.keys())
-    for i, tid in enumerate(tgt_id_list):
-        n, a, c = tgt_records[tid]
-        for tok in clean_toks(n, a):
-            inv_index[tok].append(i)
-    inv_index = {k: v for k, v in inv_index.items() if len(v) <= 300}
-    log(f"Inverted index built in {time.time()-t0:.2f}s ({len(inv_index):,} distinctive tokens)")
     
-    # 5. Build training features
-    log("Generating training candidate pairs...")
-    X_train = []
-    y_train = []
-    for sid in train_s1_ids:
-        s1_n, s1_a, s1_c = s1_records[sid]
-        toks = clean_toks(s1_n, s1_a)
-        counts = Counter()
-        for tok in toks:
-            if tok in inv_index:
-                for idx in inv_index[tok]:
-                    counts[idx] += 1
-        top = counts.most_common(20)
+    # Filter targets by country
+    ctry_tgt_ids = []
+    ctry_tgt_names = []
+    ctry_tgt_addrs = []
+    for tid, (tn, ta, tc) in tgt_recs.items():
+        if tc == country:
+            ctry_tgt_ids.append(tid)
+            ctry_tgt_names.append(tn)
+            ctry_tgt_addrs.append(ta)
+    
+    N_ctry = len(ctry_tgt_ids)
+    log(f"  {country}: {N_ctry:,} targets, {len(s1_by_country[country]):,} train S1")
+    
+    # Build inverted index on country targets
+    raw_inv = defaultdict(list)
+    for i in range(N_ctry):
+        for tok in set(clean_toks(ctry_tgt_names[i], ctry_tgt_addrs[i])):
+            raw_inv[tok].append(i)
+    inv_index = {tok: v for tok, v in raw_inv.items() if len(v) <= MAX_POSTING}
+    idf = {tok: math.log(N_ctry / (len(v) + 1)) for tok, v in inv_index.items()}
+    del raw_inv
+    log(f"  Index: {len(inv_index):,} tokens in {time.time()-t0:.1f}s")
+    
+    # Generate training pairs
+    t0 = time.time()
+    n_pairs = 0
+    for sid in s1_by_country[country]:
+        s1_n, s1_a, s1_c = s1_recs[sid]
+        s1_pre = precompute_s1(s1_n, s1_a)
         true_tgt = gt_map[sid]
-        for idx, shared_c in top:
-            tid = tgt_id_list[idx]
-            t_n, t_a, t_c = tgt_records[tid]
-            if s1_c != t_c: continue
-            feat = extract_features(s1_n, s1_a, t_n, t_a, shared_c)
-            X_train.append(feat)
-            y_train.append(1 if tid in true_tgt else 0)
-            
-    X_train = np.array(X_train)
-    y_train = np.array(y_train)
-    log(f"Total training pairs: {len(X_train):,} (Positives: {sum(y_train):,}, Negatives: {len(y_train)-sum(y_train):,})")
-    
-    # 6. Fit HistGradientBoostingClassifier
-    log("Training HistGradientBoostingClassifier (Apache-2.0, 0 pre-trained embeddings)...")
-    clf = HistGradientBoostingClassifier(random_state=42, max_iter=250, min_samples_leaf=30, l2_regularization=1.0)
-    clf.fit(X_train, y_train)
-    log("Classifier trained successfully!")
-    
-    # 7. Evaluate on validation set
-    log(f"Evaluating on {len(val_s1_ids):,} validation entities...")
-    val_candidates = {}
-    val_features = []
-    val_pairs_meta = []
-    for sid in val_s1_ids:
-        s1_n, s1_a, s1_c = s1_records[sid]
-        toks = clean_toks(s1_n, s1_a)
-        counts = Counter()
-        for tok in toks:
+        
+        scores = Counter()
+        for tok in clean_toks(s1_n, s1_a):
             if tok in inv_index:
+                w = idf[tok]
                 for idx in inv_index[tok]:
-                    counts[idx] += 1
-        top = counts.most_common(20)
-        val_candidates[sid] = []
-        for idx, shared_c in top:
-            tid = tgt_id_list[idx]
-            t_n, t_a, t_c = tgt_records[tid]
-            if s1_c != t_c: continue
-            val_candidates[sid].append(tid)
-            val_features.append(extract_features(s1_n, s1_a, t_n, t_a, shared_c))
-            val_pairs_meta.append((sid, tid))
-            
-    val_features = np.array(val_features)
-    probs = clf.predict_proba(val_features)[:, 1]
+                    scores[idx] += w
+        
+        top = sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:TOP_K]
+        
+        for idx, idf_w in top:
+            tid = ctry_tgt_ids[idx]
+            feat = extract_features(s1_pre, ctry_tgt_names[idx], ctry_tgt_addrs[idx], idf_w)
+            X_all.append(feat)
+            y_all.append(1 if tid in true_tgt else 0)
+            n_pairs += 1
     
-    # Grid search threshold
-    gt_val = {sid: gt_map[sid] for sid in val_s1_ids}
-    best_t = 0.65
-    best_score = 0.0
-    log("Tuning threshold for Macro F0.5...")
-    for t in np.arange(0.50, 0.95, 0.05):
-        scored = [(p, sid, tid) for (sid, tid), p in zip(val_pairs_meta, probs) if p >= t]
-        scored.sort(reverse=True)
-        assigned_tgt = set()
-        preds = defaultdict(list)
-        for p, sid, tid in scored:
-            if tid not in assigned_tgt:
-                preds[sid].append(tid)
-                assigned_tgt.add(tid)
-        score = macro_f05(gt_val, preds)
-        log(f"  Threshold {t:.2f} -> Macro F0.5 = {score:.4f} (Matched {len(preds):,}/{len(val_s1_ids):,} S1)")
-        if score > best_score:
-            best_score = score
-            best_t = float(t)
-            
-    log(f"OPTIMAL THRESHOLD: {best_t:.2f} with Macro F0.5 = {best_score:.4f}")
+    log(f"  {country}: {n_pairs:,} pairs in {time.time()-t0:.1f}s")
     
-    del gt_map, s1_records, tgt_records, inv_index, X_train, y_train, val_features, probs
+    # Free country-specific data
+    del ctry_tgt_ids, ctry_tgt_names, ctry_tgt_addrs, inv_index, idf
     gc.collect()
-    
-    return clf, best_t
 
-def run_test_inference(clf, threshold):
-    log("="*60)
-    log("PHASE 2: FULL TEST INFERENCE ACROSS ALL COUNTRIES")
-    log("="*60)
+X_all = np.array(X_all, dtype=np.float32)
+y_all = np.array(y_all, dtype=np.int32)
+log(f"\nTotal training pairs: {len(X_all):,} (pos: {y_all.sum():,}, neg: {(y_all==0).sum():,})")
+
+# =====================================================
+# PHASE 4: TRAIN CLASSIFIER
+# =====================================================
+log("Training HistGradientBoostingClassifier...")
+t0 = time.time()
+clf = HistGradientBoostingClassifier(
+    max_iter=300, max_depth=7, learning_rate=0.05,
+    min_samples_leaf=20, l2_regularization=0.3, random_state=42
+)
+clf.fit(X_all, y_all)
+log(f"  Trained in {time.time()-t0:.1f}s")
+del X_all, y_all
+gc.collect()
+
+# =====================================================
+# PHASE 5: VALIDATE ON HELD-OUT SET AT FULL SCALE
+# =====================================================
+log("\nValidating on held-out set at FULL TARGET SCALE...")
+val_feats, val_meta = [], []
+
+for country in countries:
+    t0 = time.time()
+    ctry_tgt_ids = []
+    ctry_tgt_names = []
+    ctry_tgt_addrs = []
+    for tid, (tn, ta, tc) in tgt_recs.items():
+        if tc == country:
+            ctry_tgt_ids.append(tid)
+            ctry_tgt_names.append(tn)
+            ctry_tgt_addrs.append(ta)
     
-    # Read test S1 list to preserve exact ordering and check completeness
-    log("Loading test_source1.tsv entity IDs...")
-    all_s1_ordered = []
+    N_ctry = len(ctry_tgt_ids)
+    
+    raw_inv = defaultdict(list)
+    for i in range(N_ctry):
+        for tok in set(clean_toks(ctry_tgt_names[i], ctry_tgt_addrs[i])):
+            raw_inv[tok].append(i)
+    inv_index = {tok: v for tok, v in raw_inv.items() if len(v) <= MAX_POSTING}
+    idf = {tok: math.log(N_ctry / (len(v) + 1)) for tok, v in inv_index.items()}
+    del raw_inv
+    
+    log(f"  {country}: scoring {len(val_by_country[country]):,} val entities against {N_ctry:,} targets")
+    
+    for sid in val_by_country[country]:
+        s1_n, s1_a, s1_c = s1_recs[sid]
+        s1_pre = precompute_s1(s1_n, s1_a)
+        
+        scores = Counter()
+        for tok in clean_toks(s1_n, s1_a):
+            if tok in inv_index:
+                w = idf[tok]
+                for idx in inv_index[tok]:
+                    scores[idx] += w
+        
+        top = sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:TOP_K]
+        
+        for idx, idf_w in top:
+            tid = ctry_tgt_ids[idx]
+            feat = extract_features(s1_pre, ctry_tgt_names[idx], ctry_tgt_addrs[idx], idf_w)
+            val_feats.append(feat)
+            val_meta.append((sid, tid))
+    
+    log(f"  {country}: done in {time.time()-t0:.1f}s")
+    del ctry_tgt_ids, ctry_tgt_names, ctry_tgt_addrs, inv_index, idf
+    gc.collect()
+
+val_feats = np.array(val_feats, dtype=np.float32)
+probs = clf.predict_proba(val_feats)[:, 1]
+log(f"  Total val pairs: {len(val_feats):,}")
+
+gt_val = {sid: gt_map[sid] for sid in val_ids}
+
+# Sweep threshold
+log("\nThreshold sweep (0.30 → 0.90):")
+best_tau, best_f05 = 0.0, 0.0
+for tau in np.arange(0.30, 0.92, 0.02):
+    tau = round(tau, 2)
+    scored = [(float(p), sid, tid) for (sid, tid), p in zip(val_meta, probs) if p >= tau]
+    scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+    assigned = set()
+    preds = defaultdict(list)
+    for p, sid, tid in scored:
+        if tid not in assigned:
+            preds[sid].append(tid)
+            assigned.add(tid)
+    f05 = macro_f05(gt_val, preds)
+    marker = "  ◄ BEST" if f05 > best_f05 else ""
+    if f05 > best_f05:
+        best_f05 = f05
+        best_tau = tau
+    log(f"  tau={tau:.2f}: F0.5={f05:.4f}{marker}")
+
+log(f"\n>>> Best tau={best_tau:.2f}, F0.5={best_f05:.4f} <<<")
+
+# Save model
+with open(os.path.join(TEMP_DIR, "clf_v7.pkl"), "wb") as f:
+    pickle.dump((clf, best_tau), f)
+log(f"Model saved to {TEMP_DIR}/clf_v7.pkl")
+
+# =====================================================
+# PHASE 6: FULL TEST INFERENCE
+# =====================================================
+log("\n" + "=" * 60)
+log("PHASE 6: FULL TEST INFERENCE")
+log("=" * 60)
+
+threshold = best_tau
+
+for country in ["France", "US", "India"]:
+    t_start = time.time()
+    log(f"\n--- INFERENCE: {country} ---")
+    
+    # Load S1 for this country
+    s1_country = []
     with open(os.path.join(TEST_DIR, "test_source1.tsv"), encoding='utf-8') as f:
         f.readline()
         for line in f:
             p = line.rstrip('\n').split('\t')
-            all_s1_ordered.append(p[0])
-    log(f"Total test Source 1 entities required: {len(all_s1_ordered):,}")
+            if len(p) >= 4 and p[3] == country:
+                s1_country.append((p[0], p[1], p[2]))
+    log(f"  S1 entities: {len(s1_country):,}")
+    if not s1_country: continue
     
-    # Outputs dictionaries
-    final_matches = defaultdict(list)     # s1_id -> [matched target ids]
-    final_candidates = defaultdict(list)  # s1_id -> [candidate target ids]
-    
-    # Process country-by-country
-    countries = ["France", "US", "India"]
-    
-    for country in countries:
-        log(f"\n>>> PROCESSING COUNTRY: {country} <<<")
-        t_country_start = time.time()
-        
-        # 1. Stream S1 for this country
-        log(f"  Loading S1 for {country}...")
-        s1_country = {}
-        with open(os.path.join(TEST_DIR, "test_source1.tsv"), encoding='utf-8') as f:
+    # Load targets for this country
+    tgt_ids_c, tgt_names_c, tgt_addrs_c = [], [], []
+    for sf in ["test_source2.tsv", "test_source3.tsv"]:
+        with open(os.path.join(TEST_DIR, sf), encoding='utf-8') as f:
             f.readline()
             for line in f:
                 p = line.rstrip('\n').split('\t')
                 if len(p) >= 4 and p[3] == country:
-                    s1_country[p[0]] = (p[1], p[2])
-        log(f"  Loaded {len(s1_country):,} S1 entities for {country}")
-        if not s1_country:
-            continue
-            
-        # 2. Stream Targets (S2 + S3) for this country
-        log(f"  Loading Targets (S2 + S3) for {country}...")
-        tgt_ids = []
-        tgt_names = []
-        tgt_addrs = []
-        for sf in ["test_source2.tsv", "test_source3.tsv"]:
-            with open(os.path.join(TEST_DIR, sf), encoding='utf-8') as f:
-                f.readline()
-                for line in f:
-                    p = line.rstrip('\n').split('\t')
-                    if len(p) >= 4 and p[3] == country:
-                        tgt_ids.append(p[0])
-                        tgt_names.append(p[1])
-                        tgt_addrs.append(p[2])
-        log(f"  Loaded {len(tgt_ids):,} targets for {country}")
-        
-        # 3. Build inverted index on targets
-        log(f"  Building distinctive token index on {len(tgt_ids):,} targets...")
-        t0 = time.time()
-        inv_index = defaultdict(list)
-        for i in range(len(tgt_ids)):
-            for tok in clean_toks(tgt_names[i], tgt_addrs[i]):
-                inv_index[tok].append(i)
-        inv_index = {k: v for k, v in inv_index.items() if len(v) <= 300}
-        log(f"  Inverted index built in {time.time()-t0:.2f}s ({len(inv_index):,} tokens)")
-        
-        # 4. Query S1 entities in batches and extract features
-        log(f"  Blocking & feature scoring for {len(s1_country):,} S1 queries...")
-        t1 = time.time()
-        
-        s1_country_items = list(s1_country.items())
-        batch_size = 50000
-        country_scored_pairs = [] # (prob, s1_id, target_id)
-        
-        for b_start in range(0, len(s1_country_items), batch_size):
-            b_end = min(b_start + batch_size, len(s1_country_items))
-            b_items = s1_country_items[b_start:b_end]
-            
-            b_feats = []
-            b_meta = [] # (s1_id, tid)
-            
-            for sid, (s1_n, s1_a) in b_items:
-                toks = clean_toks(s1_n, s1_a)
-                counts = Counter()
-                for tok in toks:
-                    if tok in inv_index:
-                        for idx in inv_index[tok]:
-                            counts[idx] += 1
-                top = counts.most_common(20)
-                
-                cands_for_sid = []
-                for idx, shared_c in top:
-                    tid = tgt_ids[idx]
-                    cands_for_sid.append(tid)
-                    feat = extract_features(s1_n, s1_a, tgt_names[idx], tgt_addrs[idx], shared_c)
-                    b_feats.append(feat)
-                    b_meta.append((sid, tid))
-                final_candidates[sid] = cands_for_sid
-                
-            if b_feats:
-                b_feats = np.array(b_feats, dtype=np.float32)
-                b_probs = clf.predict_proba(b_feats)[:, 1]
-                for (sid, tid), p in zip(b_meta, b_probs):
-                    if p >= threshold:
-                        country_scored_pairs.append((float(p), sid, tid))
-                        
-            log(f"    Processed {b_end:,}/{len(s1_country):,} S1 queries... ({len(country_scored_pairs):,} pairs >= {threshold:.2f})")
-            
-        log(f"  Blocking & scoring completed in {time.time()-t1:.2f}s")
-        
-        # 5. Greedy 1-to-1 matching for this country
-        log(f"  Applying greedy 1-to-1 matching on {len(country_scored_pairs):,} candidate matches...")
-        country_scored_pairs.sort(reverse=True)
-        assigned_tgt = set()
-        c_matched_s1 = set()
-        
-        for p, sid, tid in country_scored_pairs:
-            if tid not in assigned_tgt:
-                final_matches[sid].append(tid)
-                assigned_tgt.add(tid)
-                c_matched_s1.add(sid)
-                
-        log(f"  Country {country} Summary: Matched {len(c_matched_s1):,}/{len(s1_country):,} S1 ({len(assigned_tgt):,} unique targets assigned) in {time.time()-t_country_start:.1f}s")
-        
-        # Cleanup memory before next country
-        del s1_country, s1_country_items, tgt_ids, tgt_names, tgt_addrs, inv_index, country_scored_pairs
-        gc.collect()
-
-    # 6. Write matching_results.tsv
-    matching_path = os.path.join(OUTPUT_DIR, "matching_results.tsv")
-    log(f"\nWriting final {matching_path}...")
-    n_matched = 0
-    with open(matching_path, 'w', encoding='utf-8') as f:
-        f.write("source1_entity_id\tmatched_entity_ids\n")
-        for sid in all_s1_ordered:
-            m = final_matches.get(sid, [])
-            if m: n_matched += 1
-            f.write(f"{sid}\t{','.join(m)}\n")
-    log(f"  Done! Total S1 written: {len(all_s1_ordered):,}, Non-singleton matches: {n_matched:,} ({n_matched/len(all_s1_ordered)*100:.2f}%)")
-
-    # 7. Write candidate_pairs.tsv
-    candidate_path = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
-    log(f"Writing final {candidate_path}...")
-    with open(candidate_path, 'w', encoding='utf-8') as f:
-        f.write("source1_entity_id\tcandidate_entity_ids\n")
-        for sid in all_s1_ordered:
-            c = final_candidates.get(sid, [])
-            f.write(f"{sid}\t{','.join(c)}\n")
-    log(f"  Done! Total candidate rows written: {len(all_s1_ordered):,}")
-
-def main():
-    total_start = time.time()
-    log("="*60)
-    log("AMAZON ML CHALLENGE 2026 — BUSINESS ENTITY RESOLUTION")
-    log("="*60)
+                    tgt_ids_c.append(p[0])
+                    tgt_names_c.append(p[1])
+                    tgt_addrs_c.append(p[2])
+    N_tgt = len(tgt_ids_c)
+    log(f"  Targets: {N_tgt:,}")
     
-    clf, threshold = train_and_optimize()
-    run_test_inference(clf, threshold)
+    # Build inverted index
+    t0 = time.time()
+    raw_inv = defaultdict(list)
+    for i in range(N_tgt):
+        for tok in set(clean_toks(tgt_names_c[i], tgt_addrs_c[i])):
+            raw_inv[tok].append(i)
+    inv_index = {tok: v for tok, v in raw_inv.items() if len(v) <= MAX_POSTING}
+    idf = {tok: math.log(N_tgt / (len(v) + 1)) for tok, v in inv_index.items()}
+    del raw_inv
+    log(f"  Index: {len(inv_index):,} tokens in {time.time()-t0:.1f}s")
     
-    log("="*60)
-    log(f"PIPELINE COMPLETED SUCCESSFULLY IN {(time.time()-total_start)/60:.2f} MINUTES!")
-    log("="*60)
+    # Stream batch scoring with adaptive candidates
+    batch_size = 50000
+    all_scored_pairs = []
+    cand_temp_path = os.path.join(TEMP_DIR, f"cands_{country}.tsv")
+    f_cand = open(cand_temp_path, "w", encoding="utf-8")
+    
+    for b_start in range(0, len(s1_country), batch_size):
+        b_end = min(b_start + batch_size, len(s1_country))
+        tb0 = time.time()
+        b_feats, b_meta = [], []
+        
+        for sid, s1_n, s1_a in s1_country[b_start:b_end]:
+            scores = Counter()
+            for tok in clean_toks(s1_n, s1_a):
+                if tok in inv_index:
+                    w = idf[tok]
+                    for idx in inv_index[tok]:
+                        scores[idx] += w
+            
+            top = sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:TOP_K]
+            
+            # Adaptive pruning
+            if top:
+                top_score = top[0][1]
+                cutoff = ALPHA_ADAPTIVE * top_score
+                top = [(idx, w) for idx, w in top if w >= cutoff]
+            
+            cand_ids = []
+            s1_pre = precompute_s1(s1_n, s1_a)
+            for idx, idf_w in top:
+                tid = tgt_ids_c[idx]
+                cand_ids.append(tid)
+                feat = extract_features(s1_pre, tgt_names_c[idx], tgt_addrs_c[idx], idf_w)
+                b_feats.append(feat)
+                b_meta.append((sid, tid))
+            
+            f_cand.write(f"{sid}\t{','.join(cand_ids)}\n")
+        
+        if b_feats:
+            b_feats_arr = np.array(b_feats, dtype=np.float32)
+            b_probs = clf.predict_proba(b_feats_arr)[:, 1]
+            for (sid, tid), p in zip(b_meta, b_probs):
+                if p >= threshold:
+                    all_scored_pairs.append((float(p), sid, tid))
+        
+        log(f"    Batch {b_end:,}/{len(s1_country):,} in {time.time()-tb0:.1f}s | {len(all_scored_pairs):,} matches")
+    
+    f_cand.close()
+    
+    # Greedy 1-to-1 assignment
+    all_scored_pairs.sort(key=lambda x: (-x[0], x[1], x[2]))
+    assigned_targets = set()
+    s1_matches = defaultdict(list)
+    for p, sid, tid in all_scored_pairs:
+        if tid not in assigned_targets:
+            s1_matches[sid].append(tid)
+            assigned_targets.add(tid)
+    
+    match_temp_path = os.path.join(TEMP_DIR, f"matches_{country}.tsv")
+    with open(match_temp_path, "w", encoding="utf-8") as f_match:
+        for sid, _, _ in s1_country:
+            m = s1_matches.get(sid, [])
+            f_match.write(f"{sid}\t{','.join(m)}\n")
+    
+    log(f"  {country}: {len(s1_matches):,}/{len(s1_country):,} matched ({len(assigned_targets):,} targets) in {time.time()-t_start:.1f}s")
+    
+    del s1_country, tgt_ids_c, tgt_names_c, tgt_addrs_c, inv_index, idf
+    del all_scored_pairs, s1_matches, assigned_targets
+    gc.collect()
 
-if __name__ == "__main__":
-    main()
+# =====================================================
+# PHASE 7: ASSEMBLE FINAL OUTPUT
+# =====================================================
+log("\n" + "=" * 60)
+log("ASSEMBLING FINAL OUTPUT")
+log("=" * 60)
+
+canonical_s1 = []
+with open(os.path.join(TEST_DIR, "test_source1.tsv"), encoding='utf-8') as f:
+    f.readline()
+    for line in f:
+        canonical_s1.append(line.split('\t')[0])
+log(f"Canonical test entities: {len(canonical_s1):,}")
+
+# Merge matches
+matches_map = {}
+for country in ["France", "US", "India"]:
+    p = os.path.join(TEMP_DIR, f"matches_{country}.tsv")
+    if os.path.exists(p):
+        with open(p, encoding='utf-8') as f:
+            for line in f:
+                parts = line.rstrip('\n').split('\t')
+                matches_map[parts[0]] = parts[1] if len(parts) > 1 else ''
+
+# Merge candidates
+cands_map = {}
+for country in ["France", "US", "India"]:
+    p = os.path.join(TEMP_DIR, f"cands_{country}.tsv")
+    if os.path.exists(p):
+        with open(p, encoding='utf-8') as f:
+            for line in f:
+                parts = line.rstrip('\n').split('\t')
+                cands_map[parts[0]] = parts[1] if len(parts) > 1 else ''
+
+# Write final files
+match_out = os.path.join(OUTPUT_DIR, "matching_results.tsv")
+cand_out  = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
+
+with open(match_out, "w", encoding="utf-8") as fm, \
+     open(cand_out, "w", encoding="utf-8") as fc:
+    fm.write("source1_entity_id\tmatched_entity_ids\n")
+    fc.write("source1_entity_id\tcandidate_entity_ids\n")
+    
+    matched_count = 0
+    singleton_count = 0
+    for sid in canonical_s1:
+        m = matches_map.get(sid, '')
+        c = cands_map.get(sid, '')
+        fm.write(f"{sid}\t{m}\n")
+        fc.write(f"{sid}\t{c}\n")
+        if m.strip():
+            matched_count += 1
+        else:
+            singleton_count += 1
+
+log(f"Output: {matched_count:,} matched, {singleton_count:,} singletons ({singleton_count/(matched_count+singleton_count)*100:.1f}%)")
+log(f"Files: {match_out}, {cand_out}")
+
+# Validate
+log("\nRunning validator...")
+import subprocess
+r = subprocess.run(
+    ["python", os.path.join(BASE, "utils", "validate_submission.py"),
+     "--matching", match_out, "--candidate", cand_out, "--test-dir", TEST_DIR],
+    capture_output=True, text=True, encoding='utf-8'
+)
+log(r.stdout)
+if r.returncode != 0:
+    log(f"VALIDATOR STDERR: {r.stderr}")
+
+log("\nDONE.")

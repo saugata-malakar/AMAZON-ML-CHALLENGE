@@ -3,6 +3,7 @@ DATASET/
 dataset/
 submission_pkg/
 output/*.tsv
+*.tsv
 *.zip
 *.tar.gz
 *.7z
